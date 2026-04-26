@@ -1,6 +1,9 @@
 package envelope
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 const (
 	FlagCompressed byte = 1 << 0

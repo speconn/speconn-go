@@ -5,28 +5,34 @@ import (
 	"net/http"
 )
 
-type UnaryHandler[Req any, Res any] func(req *Req) (*Res, error)
+type UnaryHandlerFunc[Req any, Res any] func(req *Req) (*Res, error)
 
-func NewUnaryHandler[Req any, Res any](path string, fn UnaryHandler[Req, Res]) (string, http.Handler) {
+func NewUnaryHandler[Req any, Res any](path string, fn UnaryHandlerFunc[Req, Res]) (string, http.Handler) {
 	return path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, CodeUnimplemented, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req Req
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, NewError(CodeInvalidArgument, err.Error()))
-			return
+		if r.ContentLength > 0 {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSONError(w, CodeInvalidArgument, err.Error(), 0)
+				return
+			}
 		}
 
 		res, err := fn(&req)
 		if err != nil {
-			if speconnErr, ok := err.(*Error); ok {
-				writeError(w, speconnErr)
-			} else {
-				writeError(w, NewError(CodeInternal, err.Error()))
+			code := CodeInternal
+			msg := err.Error()
+			status := 0
+			if se, ok := err.(*Error); ok {
+				code = se.Code
+				msg = se.Message
+				status = CodeToHTTP(se.Code)
 			}
+			writeJSONError(w, code, msg, status)
 			return
 		}
 
@@ -35,8 +41,11 @@ func NewUnaryHandler[Req any, Res any](path string, fn UnaryHandler[Req, Res]) (
 	})
 }
 
-func writeError(w http.ResponseWriter, err *Error) {
+func writeJSONError(w http.ResponseWriter, code Code, message string, status int) {
+	if status == 0 {
+		status = CodeToHTTP(code)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(CodeToHTTP(err.Code))
-	json.NewEncoder(w).Encode(err)
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(&Error{Code: code, Message: message})
 }
