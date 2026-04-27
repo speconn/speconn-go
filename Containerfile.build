@@ -1,0 +1,12 @@
+FROM dhi.io/golang:1-alpine3.23-dev AS builder
+WORKDIR /app
+COPY go.mod ./
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    GOPROXY=https://goproxy.cn,direct go mod download || true
+COPY . .
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go vet ./... && go build ./...
+
+FROM scratch
+COPY --from=builder /app/go.mod /out/go.mod
