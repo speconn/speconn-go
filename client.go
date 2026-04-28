@@ -5,21 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 )
 
-type callOptions struct {
-	headers map[string]string
+// Request wraps a message with headers, following ConnectRPC's pattern.
+type Request[T any] struct {
+	Msg    *T
+	Header http.Header
 }
 
-type CallOption func(*callOptions)
+// NewRequest creates a new Request with an empty header map.
+func NewRequest[T any](msg *T) *Request[T] {
+	return &Request[T]{Msg: msg, Header: make(http.Header)}
+}
 
-func WithHeader(key, value string) CallOption {
-	return func(o *callOptions) {
-		if o.headers == nil {
-			o.headers = map[string]string{}
-		}
-		o.headers[key] = value
-	}
+// Response wraps a response message with headers.
+type Response[T any] struct {
+	Msg    *T
+	Header http.Header
 }
 
 type SpeconnClient[Req any, Res any] struct {
@@ -40,18 +43,20 @@ func NewClientWithTransport[Req any, Res any](baseURL, path string, transport Tr
 	}
 }
 
-func (c *SpeconnClient[Req, Res]) Call(req *Req, opts ...CallOption) (*Res, error) {
-	var o callOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	body, err := json.Marshal(req)
+func (c *SpeconnClient[Req, Res]) Call(req *Request[Req]) (*Response[Res], error) {
+	body, err := json.Marshal(req.Msg)
 	if err != nil {
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
 	}
 
-	resp, err := c.transport.Post(c.baseURL+c.path, "application/json", body, o.headers)
+	headers := map[string]string{}
+	for k, vs := range req.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
+	}
+
+	resp, err := c.transport.Post(c.baseURL+c.path, "application/json", body, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -68,16 +73,11 @@ func (c *SpeconnClient[Req, Res]) Call(req *Req, opts ...CallOption) (*Res, erro
 	if err := json.Unmarshal(resp.Body, &res); err != nil {
 		return nil, fmt.Errorf("speconn: unmarshal response: %w", err)
 	}
-	return &res, nil
+	return &Response[Res]{Msg: &res, Header: make(http.Header)}, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Stream(req *Req, opts ...CallOption) ([]Res, error) {
-	var o callOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	body, err := json.Marshal(req)
+func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req]) ([]*Response[Res], error) {
+	body, err := json.Marshal(req.Msg)
 	if err != nil {
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
 	}
@@ -85,8 +85,10 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Req, opts ...CallOption) ([]Res, e
 	headers := map[string]string{
 		"Connect-Protocol-Version": "1",
 	}
-	for k, v := range o.headers {
-		headers[k] = v
+	for k, vs := range req.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
 	}
 
 	resp, err := c.transport.Post(c.baseURL+c.path, "application/connect+json", body, headers)
@@ -102,7 +104,7 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Req, opts ...CallOption) ([]Res, e
 		return nil, NewError(CodeFromHTTPStatus(resp.Status), string(resp.Body))
 	}
 
-	var results []Res
+	var results []*Response[Res]
 	reader := &frameReader{data: resp.Body}
 
 	for {
@@ -130,7 +132,7 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Req, opts ...CallOption) ([]Res, e
 		if err := json.Unmarshal(payload, &msg); err != nil {
 			return nil, NewError(CodeInternal, "unmarshal stream message: "+err.Error())
 		}
-		results = append(results, msg)
+		results = append(results, &Response[Res]{Msg: &msg, Header: make(http.Header)})
 	}
 
 	return results, nil

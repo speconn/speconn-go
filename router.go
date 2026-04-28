@@ -58,6 +58,32 @@ func (r *SpeconnRouter) ServerStream(path string, handler func(ctx *SpeconnConte
 	return r
 }
 
+// RegisterUnary registers a typed unary handler, eliminating double json marshal/unmarshal.
+func RegisterUnary[Req any, Res any](r *SpeconnRouter, path string, handler func(ctx *SpeconnContext, req *Req) (*Res, error)) {
+	r.unaryRoutes[path] = func(ctx *SpeconnContext, raw any) (any, error) {
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return nil, NewError(CodeInvalidArgument, err.Error())
+		}
+		var req Req
+		if err := json.Unmarshal(b, &req); err != nil {
+			return nil, NewError(CodeInvalidArgument, err.Error())
+		}
+		return handler(ctx, &req)
+	}
+}
+
+// RegisterServerStream registers a typed server-streaming handler.
+func RegisterServerStream[Req any, Res any](r *SpeconnRouter, path string, handler func(ctx *SpeconnContext, req *Req, send func(*Res) error) error) {
+	r.streamRoutes[path] = func(ctx *SpeconnContext, raw any, send func(any)) {
+		b, _ := json.Marshal(raw)
+		var req Req
+		json.Unmarshal(b, &req)
+		typedSend := func(msg *Res) error { send(msg); return nil }
+		handler(ctx, &req, typedSend)
+	}
+}
+
 func (r *SpeconnRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
