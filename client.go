@@ -1,6 +1,7 @@
 package speconn
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -26,21 +27,44 @@ type Response[T any] struct {
 }
 
 type SpeconnClient[Req any, Res any] struct {
-	baseURL   string
-	path      string
-	transport Transport
+	baseURL    string
+	path       string
+	httpClient HttpClient
 }
 
 func NewClient[Req any, Res any](baseURL, path string) *SpeconnClient[Req, Res] {
-	return NewClientWithTransport[Req, Res](baseURL, path, NewDefaultTransport())
+	return NewClientWithHttpClient[Req, Res](baseURL, path, defaultHttpClient)
 }
 
-func NewClientWithTransport[Req any, Res any](baseURL, path string, transport Transport) *SpeconnClient[Req, Res] {
+func NewClientWithHttpClient[Req any, Res any](baseURL, path string, httpClient HttpClient) *SpeconnClient[Req, Res] {
 	return &SpeconnClient[Req, Res]{
-		baseURL:   baseURL,
-		path:      path,
-		transport: transport,
+		baseURL:    baseURL,
+		path:       path,
+		httpClient: httpClient,
 	}
+}
+
+func (c *SpeconnClient[Req, Res]) doPost(url, contentType string, body []byte, reqHeader http.Header) (int, []byte, http.Header, error) {
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, nil, NewError(CodeInternal, err.Error())
+	}
+	httpReq.Header.Set("Content-Type", contentType)
+	for k, vs := range reqHeader {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return 0, nil, nil, NewError(CodeUnavailable, err.Error())
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, nil, NewError(CodeInternal, "read response: "+err.Error())
+	}
+	return resp.StatusCode, respBody, resp.Header, nil
 }
 
 func (c *SpeconnClient[Req, Res]) Call(req *Request[Req]) (*Response[Res], error) {
@@ -49,31 +73,24 @@ func (c *SpeconnClient[Req, Res]) Call(req *Request[Req]) (*Response[Res], error
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
 	}
 
-	headers := map[string]string{}
-	for k, vs := range req.Header {
-		if len(vs) > 0 {
-			headers[k] = vs[0]
-		}
-	}
-
-	resp, err := c.transport.Post(c.baseURL+c.path, "application/json", body, headers)
+	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, "application/json", body, req.Header)
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.Status != 200 {
+	if status != 200 {
 		var speconnErr SpeconnError
-		if err := json.Unmarshal(resp.Body, &speconnErr); err == nil && speconnErr.Code != "" {
+		if err := json.Unmarshal(respBody, &speconnErr); err == nil && speconnErr.Code != "" {
 			return nil, &speconnErr
 		}
-		return nil, NewError(CodeFromHTTPStatus(resp.Status), string(resp.Body))
+		return nil, NewError(CodeFromHTTPStatus(status), string(respBody))
 	}
 
 	var res Res
-	if err := json.Unmarshal(resp.Body, &res); err != nil {
+	if err := json.Unmarshal(respBody, &res); err != nil {
 		return nil, fmt.Errorf("speconn: unmarshal response: %w", err)
 	}
-	return &Response[Res]{Msg: &res, Header: make(http.Header)}, nil
+	return &Response[Res]{Msg: &res, Header: respHeader}, nil
 }
 
 func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req]) ([]*Response[Res], error) {
@@ -82,30 +99,24 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req]) ([]*Response[Res], e
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
 	}
 
-	headers := map[string]string{
-		"Connect-Protocol-Version": "1",
-	}
-	for k, vs := range req.Header {
-		if len(vs) > 0 {
-			headers[k] = vs[0]
-		}
-	}
+	streamHeader := req.Header.Clone()
+	streamHeader.Set("Connect-Protocol-Version", "1")
 
-	resp, err := c.transport.Post(c.baseURL+c.path, "application/connect+json", body, headers)
+	status, respBody, _, err := c.doPost(c.baseURL+c.path, "application/connect+json", body, streamHeader)
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.Status != 200 {
+	if status != 200 {
 		var speconnErr SpeconnError
-		if err := json.Unmarshal(resp.Body, &speconnErr); err == nil && speconnErr.Code != "" {
+		if err := json.Unmarshal(respBody, &speconnErr); err == nil && speconnErr.Code != "" {
 			return nil, &speconnErr
 		}
-		return nil, NewError(CodeFromHTTPStatus(resp.Status), string(resp.Body))
+		return nil, NewError(CodeFromHTTPStatus(status), string(respBody))
 	}
 
 	var results []*Response[Res]
-	reader := &frameReader{data: resp.Body}
+	reader := &frameReader{data: respBody}
 
 	for {
 		flags, payload, err := reader.next()
