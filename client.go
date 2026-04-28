@@ -7,6 +7,21 @@ import (
 	"io"
 )
 
+type callOptions struct {
+	headers map[string]string
+}
+
+type CallOption func(*callOptions)
+
+func WithHeader(key, value string) CallOption {
+	return func(o *callOptions) {
+		if o.headers == nil {
+			o.headers = map[string]string{}
+		}
+		o.headers[key] = value
+	}
+}
+
 type SpeconnClient[Req any, Res any] struct {
 	baseURL   string
 	path      string
@@ -25,13 +40,18 @@ func NewClientWithTransport[Req any, Res any](baseURL, path string, transport Tr
 	}
 }
 
-func (c *SpeconnClient[Req, Res]) Call(req *Req) (*Res, error) {
+func (c *SpeconnClient[Req, Res]) Call(req *Req, opts ...CallOption) (*Res, error) {
+	var o callOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
 	}
 
-	resp, err := c.transport.Post(c.baseURL+c.path, "application/json", body, nil)
+	resp, err := c.transport.Post(c.baseURL+c.path, "application/json", body, o.headers)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +71,12 @@ func (c *SpeconnClient[Req, Res]) Call(req *Req) (*Res, error) {
 	return &res, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Stream(req *Req) ([]Res, error) {
+func (c *SpeconnClient[Req, Res]) Stream(req *Req, opts ...CallOption) ([]Res, error) {
+	var o callOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("speconn: marshal request: %w", err)
@@ -59,6 +84,9 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Req) ([]Res, error) {
 
 	headers := map[string]string{
 		"Connect-Protocol-Version": "1",
+	}
+	for k, v := range o.headers {
+		headers[k] = v
 	}
 
 	resp, err := c.transport.Post(c.baseURL+c.path, "application/connect+json", body, headers)
