@@ -1,14 +1,12 @@
 package speconn
 
 import (
+	"io"
 	"net/http"
 )
 
-// HttpClient is the interface Speconn expects HTTP clients to implement.
-// The standard library's *http.Client implements HttpClient.
-type HttpClient interface {
+type SpeconnTransport interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// defaultHttpClient wraps http.DefaultClient.
-var defaultHttpClient HttpClient = http.DefaultClient
+var defaultTransport SpeconnTransport = http.DefaultClient

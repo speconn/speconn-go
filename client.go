@@ -9,18 +9,15 @@ import (
 	"net/http"
 )
 
-// Request wraps a message with headers, following ConnectRPC's pattern.
 type Request[T any] struct {
 	Msg    *T
 	Header http.Header
 }
 
-// NewRequest creates a new Request with an empty header map.
 func NewRequest[T any](msg *T) *Request[T] {
 	return &Request[T]{Msg: msg, Header: make(http.Header)}
 }
 
-// Response wraps a response message with headers.
 type Response[T any] struct {
 	Msg    *T
 	Header http.Header
@@ -29,18 +26,18 @@ type Response[T any] struct {
 type SpeconnClient[Req any, Res any] struct {
 	baseURL    string
 	path       string
-	httpClient HttpClient
+	transport  SpeconnTransport
 }
 
 func NewClient[Req any, Res any](baseURL, path string) *SpeconnClient[Req, Res] {
-	return NewClientWithHttpClient[Req, Res](baseURL, path, defaultHttpClient)
+	return NewClientWithTransport[Req, Res](baseURL, path, defaultTransport)
 }
 
-func NewClientWithHttpClient[Req any, Res any](baseURL, path string, httpClient HttpClient) *SpeconnClient[Req, Res] {
+func NewClientWithTransport[Req any, Res any](baseURL, path string, transport SpeconnTransport) *SpeconnClient[Req, Res] {
 	return &SpeconnClient[Req, Res]{
-		baseURL:    baseURL,
-		path:       path,
-		httpClient: httpClient,
+		baseURL:   baseURL,
+		path:      path,
+		transport: transport,
 	}
 }
 
@@ -55,7 +52,7 @@ func (c *SpeconnClient[Req, Res]) doPost(url, contentType string, body []byte, r
 			httpReq.Header.Add(k, v)
 		}
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.transport.Do(httpReq)
 	if err != nil {
 		return 0, nil, nil, NewError(CodeUnavailable, err.Error())
 	}
