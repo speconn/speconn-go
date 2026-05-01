@@ -1,7 +1,6 @@
 package speconn
 
 import (
-	"io"
 	"net/http"
 )
 

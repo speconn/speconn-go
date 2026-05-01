@@ -1,224 +1,180 @@
 package speconn
 
 import (
-	"encoding/json"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 )
 
-type SpeconnRequest struct {
-	Path        string
-	Headers     http.Header
-	Body        map[string]any
-	ContentType string
-}
+type Handler func(ctx *SpeconnContext, body []byte, ct string, accept string) ([]byte, error)
 
-type SpeconnResponse struct {
-	Status  int
-	Headers http.Header
-	Body    any
-}
+type StreamHandler func(ctx *SpeconnContext, body []byte, ct string, accept string, send func([]byte) error) error
 
 type Interceptor interface {
-	Before(ctx *SpeconnContext, req *SpeconnRequest) error
-	After(ctx *SpeconnContext, resp *SpeconnResponse)
+	Before(ctx *SpeconnContext, req *http.Request) error
+	After(ctx *SpeconnContext, w http.ResponseWriter) error
 }
 
-type SpeconnRouter struct {
-	unaryRoutes  map[string]func(*SpeconnContext, any) (any, error)
-	streamRoutes map[string]func(*SpeconnContext, any, func(any))
+type Router struct {
+	mu           sync.RWMutex
+	unaryRoutes  map[string]Handler
+	streamRoutes map[string]StreamHandler
 	interceptors []Interceptor
 }
 
-type RouterOption func(*SpeconnRouter)
-
-func WithInterceptors(interceptors ...Interceptor) RouterOption {
-	return func(r *SpeconnRouter) {
-		r.interceptors = append(r.interceptors, interceptors...)
+func NewRouter() *Router {
+	return &Router{
+		unaryRoutes:  make(map[string]Handler),
+		streamRoutes: make(map[string]StreamHandler),
+		interceptors: make([]Interceptor, 0),
 	}
 }
 
-func NewRouter(opts ...RouterOption) *SpeconnRouter {
-	r := &SpeconnRouter{
-		unaryRoutes:  make(map[string]func(*SpeconnContext, any) (any, error)),
-		streamRoutes: make(map[string]func(*SpeconnContext, any, func(any))),
-	}
-	for _, opt := range opts {
-		opt(r)
-	}
-	return r
-}
-
-func (r *SpeconnRouter) Unary(path string, handler func(ctx *SpeconnContext, req any) (any, error)) *SpeconnRouter {
+func (r *Router) AddUnaryHandler(path string, handler Handler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.unaryRoutes[path] = handler
-	return r
 }
 
-func (r *SpeconnRouter) ServerStream(path string, handler func(ctx *SpeconnContext, req any, send func(any))) *SpeconnRouter {
+func (r *Router) AddStreamHandler(path string, handler StreamHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.streamRoutes[path] = handler
-	return r
 }
 
-// RegisterUnary registers a typed unary handler, eliminating double json marshal/unmarshal.
-func RegisterUnary[Req any, Res any](r *SpeconnRouter, path string, handler func(ctx *SpeconnContext, req *Req) (*Res, error)) {
-	r.unaryRoutes[path] = func(ctx *SpeconnContext, raw any) (any, error) {
-		b, err := json.Marshal(raw)
-		if err != nil {
-			return nil, NewError(CodeInvalidArgument, err.Error())
-		}
-		var req Req
-		if err := json.Unmarshal(b, &req); err != nil {
-			return nil, NewError(CodeInvalidArgument, err.Error())
-		}
-		return handler(ctx, &req)
-	}
+func (r *Router) AddInterceptor(interceptor Interceptor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.interceptors = append(r.interceptors, interceptor)
 }
 
-// RegisterServerStream registers a typed server-streaming handler.
-func RegisterServerStream[Req any, Res any](r *SpeconnRouter, path string, handler func(ctx *SpeconnContext, req *Req, send func(*Res) error) error) {
-	r.streamRoutes[path] = func(ctx *SpeconnContext, raw any, send func(any)) {
-		b, _ := json.Marshal(raw)
-		var req Req
-		json.Unmarshal(b, &req)
-		typedSend := func(msg *Res) error { send(msg); return nil }
-		handler(ctx, &req, typedSend)
-	}
-}
-
-func (r *SpeconnRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	path := req.URL.Path
-	contentType := req.Header.Get("Content-Type")
+	timeoutMs := 0
+	if timeoutHeader := req.Header.Get("Speconn-Timeout-Ms"); timeoutHeader != "" {
+		if parsed, err := strconv.Atoi(timeoutHeader); err == nil && parsed > 0 {
+			timeoutMs = parsed
+		}
+	}
 
-	var body map[string]any
-	if req.ContentLength > 0 {
-		body = map[string]any{}
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeRouterError(w, CodeInvalidArgument, err.Error(), 0)
+	ctx := NewSpeconnContextFromRequest(req, timeoutMs)
+
+	for _, interceptor := range r.interceptors {
+		if err := interceptor.Before(ctx, req); err != nil {
+			handleError(w, err)
+			ctx.Cleanup()
 			return
+		}
+	}
+
+	path := req.URL.Path
+	ct := req.Header.Get("Content-Type")
+	accept := req.Header.Get("Accept")
+	if accept == "" {
+		accept = ct
+	}
+
+	var body []byte
+	if req.ContentLength > 0 {
+		body, _ = io.ReadAll(req.Body)
+	} else {
+		body = []byte{}
+	}
+
+	r.mu.RLock()
+	isStream := strings.Contains(ct, "connect+")
+	
+	if isStream {
+		if handler, ok := r.streamRoutes[path]; ok {
+			r.mu.RUnlock()
+			handleStreamRPC(w, ctx, handler, body, ct, accept)
+		} else {
+			r.mu.RUnlock()
+			http.NotFound(w, req)
 		}
 	} else {
-		body = map[string]any{}
-	}
-
-	speconnReq := &SpeconnRequest{
-		Path:        path,
-		Headers:     req.Header,
-		Body:        body,
-		ContentType: contentType,
-	}
-
-	ctx := &SpeconnContext{
-		Headers: req.Header,
-		Values:  make(map[string]any),
-	}
-
-	for _, i := range r.interceptors {
-		if err := i.Before(ctx, speconnReq); err != nil {
-			code := CodeInternal
-			msg := err.Error()
-			status := 0
-			if se, ok := err.(*SpeconnError); ok {
-				code = se.Code
-				msg = se.Message
-				status = code.HTTPStatus()
-			}
-			writeRouterError(w, code, msg, status)
-			return
+		if handler, ok := r.unaryRoutes[path]; ok {
+			r.mu.RUnlock()
+			handleUnaryRPC(w, ctx, handler, body, ct, accept)
+		} else {
+			r.mu.RUnlock()
+			http.NotFound(w, req)
 		}
 	}
 
-	isStream := speconnReq.ContentType != "" && containsStream(speconnReq.ContentType)
-
-	if isStream {
-		if h, ok := r.streamRoutes[speconnReq.Path]; ok {
-			r.handleStream(w, ctx, h, speconnReq)
-			return
-		}
+	for _, interceptor := range r.interceptors {
+		interceptor.After(ctx, w)
 	}
 
-	if h, ok := r.unaryRoutes[speconnReq.Path]; ok {
-		handlerResult, handlerErr := h(ctx, speconnReq.Body)
-
-		if handlerErr != nil {
-			code := CodeInternal
-			msg := handlerErr.Error()
-			status := 0
-			if se, ok := handlerErr.(*SpeconnError); ok {
-				code = se.Code
-				msg = se.Message
-				status = code.HTTPStatus()
-			}
-			writeRouterError(w, code, msg, status)
-			return
-		}
-
-		speconnResp := &SpeconnResponse{
-			Status:  200,
-			Headers: make(http.Header),
-			Body:    handlerResult,
-		}
-
-		for _, i := range r.interceptors {
-			i.After(ctx, speconnResp)
-		}
-
-		for k, v := range speconnResp.Headers {
-			for _, vv := range v {
-				w.Header().Add(k, vv)
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(speconnResp.Status)
-		json.NewEncoder(w).Encode(speconnResp.Body)
-		return
-	}
-
-	writeRouterError(w, CodeUnimplemented, "not found", http.StatusNotFound)
+	ctx.Cleanup()
 }
 
-func (r *SpeconnRouter) handleStream(w http.ResponseWriter, ctx *SpeconnContext, handler func(*SpeconnContext, any, func(any)), speconnReq *SpeconnRequest) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeRouterError(w, CodeInternal, "streaming not supported", 500)
+func handleUnaryRPC(w http.ResponseWriter, ctx *SpeconnContext, handler Handler, body []byte, ct string, accept string) {
+	respBody, err := handler(ctx, body, ct, accept)
+	if err != nil {
+		handleError(w, err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/connect+json")
+	for k, v := range ctx.ResponseHeaders {
+		w.Header()[k] = v
+	}
+
+	w.Header().Set("Content-Type", FormatToMime(ExtractFormat(accept), false))
+	w.WriteHeader(http.StatusOK)
+	w.Write(respBody)
+}
+
+func handleStreamRPC(w http.ResponseWriter, ctx *SpeconnContext, handler StreamHandler, body []byte, ct string, accept string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write(NewError(CodeInternal, "streaming not supported").Encode("json"))
+		return
+	}
+
+	for k, v := range ctx.ResponseHeaders {
+		w.Header()[k] = v
+	}
+
+	w.Header().Set("Content-Type", FormatToMime(ExtractFormat(accept), true))
 	w.Header().Set("Connect-Protocol-Version", "1")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	send := func(msg any) {
-		payload, err := json.Marshal(msg)
-		if err != nil {
-			return
-		}
-		frame := EncodeEnvelope(0, payload)
-		w.Write(frame)
+	ctx.MarkHeadersSent()
+
+	send := func(data []byte) error {
+		envelope := EncodeEnvelope(0, data)
+		w.Write(envelope)
 		flusher.Flush()
+		return nil
 	}
 
-	handler(ctx, speconnReq.Body, send)
+	err := handler(ctx, body, ct, accept, send)
 
-	endPayload, _ := json.Marshal(map[string]any{})
-	w.Write(EncodeEnvelope(FlagEndStream, endPayload))
+	resFmt := ExtractFormat(accept)
+	if err != nil {
+		se, ok := err.(*SpeconnError)
+		if !ok { se = NewError(CodeInternal, err.Error()) }
+		w.Write(EncodeEnvelope(FlagEndStream, se.Encode(resFmt)))
+	} else {
+		w.Write(EncodeEnvelope(FlagEndStream, []byte{}))
+	}
 	flusher.Flush()
 }
 
-func containsStream(ct string) bool {
-	return ct != "" && (ct == "application/connect+json" || len(ct) > 22 && ct[:22] == "application/connect+json")
-}
-
-func writeRouterError(w http.ResponseWriter, code Code, message string, status int) {
-	if status == 0 {
-		status = code.HTTPStatus()
-	}
+func handleError(w http.ResponseWriter, err error) {
+	se, ok := err.(*SpeconnError)
+	if !ok { se = NewError(CodeInternal, err.Error()) }
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(&SpeconnError{Code: code, Message: message})
+	w.WriteHeader(se.Code.HTTPStatus())
+	w.Write(se.Encode("json"))
 }

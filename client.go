@@ -3,10 +3,11 @@ package speconn
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/specodec/specodec-go"
 )
 
 type Request[T any] struct {
@@ -24,9 +25,9 @@ type Response[T any] struct {
 }
 
 type SpeconnClient[Req any, Res any] struct {
-	baseURL    string
-	path       string
-	transport  SpeconnTransport
+	baseURL   string
+	path      string
+	transport SpeconnTransport
 }
 
 func NewClient[Req any, Res any](baseURL, path string) *SpeconnClient[Req, Res] {
@@ -41,12 +42,23 @@ func NewClientWithTransport[Req any, Res any](baseURL, path string, transport Sp
 	}
 }
 
-func (c *SpeconnClient[Req, Res]) doPost(url, contentType string, body []byte, reqHeader http.Header) (int, []byte, http.Header, error) {
+func getContentType(h http.Header) string {
+	return h.Get("Content-Type")
+}
+
+func getAccept(h http.Header) string {
+	accept := h.Get("Accept")
+	if accept == "" {
+		accept = getContentType(h)
+	}
+	return accept
+}
+
+func (c *SpeconnClient[Req, Res]) doPost(url string, body []byte, reqHeader http.Header) (int, []byte, http.Header, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, NewError(CodeInternal, err.Error())
 	}
-	httpReq.Header.Set("Content-Type", contentType)
 	for k, vs := range reqHeader {
 		for _, v := range vs {
 			httpReq.Header.Add(k, v)
@@ -64,52 +76,51 @@ func (c *SpeconnClient[Req, Res]) doPost(url, contentType string, body []byte, r
 	return resp.StatusCode, respBody, resp.Header, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Call(req *Request[Req]) (*Response[Res], error) {
-	body, err := json.Marshal(req.Msg)
-	if err != nil {
-		return nil, fmt.Errorf("speconn: marshal request: %w", err)
-	}
+func (c *SpeconnClient[Req, Res]) Call(req *Request[Req], reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res]) (*Response[Res], error) {
+	contentType := getContentType(req.Header)
+	accept := getAccept(req.Header)
 
-	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, "application/json", body, req.Header)
+	reqFmt := ExtractFormat(contentType)
+	resFmt := ExtractFormat(accept)
+
+	result := specodec.Respond(reqCodec, req.Msg, reqFmt)
+	req.Header.Set("Content-Type", FormatToMime(reqFmt, false))
+	req.Header.Set("Accept", FormatToMime(resFmt, false))
+
+	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, result.Body, req.Header)
 	if err != nil {
 		return nil, err
 	}
 
 	if status != 200 {
-		var speconnErr SpeconnError
-		if err := json.Unmarshal(respBody, &speconnErr); err == nil && speconnErr.Code != "" {
-			return nil, &speconnErr
-		}
-		return nil, NewError(CodeFromHTTPStatus(status), string(respBody))
+		return nil, DecodeError(respBody, resFmt)
 	}
 
-	var res Res
-	if err := json.Unmarshal(respBody, &res); err != nil {
-		return nil, fmt.Errorf("speconn: unmarshal response: %w", err)
-	}
-	return &Response[Res]{Msg: &res, Header: respHeader}, nil
+	res := specodec.Dispatch(resCodec, respBody, resFmt)
+	return &Response[Res]{Msg: res, Header: respHeader}, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req]) ([]*Response[Res], error) {
-	body, err := json.Marshal(req.Msg)
-	if err != nil {
-		return nil, fmt.Errorf("speconn: marshal request: %w", err)
-	}
+func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req], reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res]) ([]*Response[Res], error) {
+	reqFmt := ExtractFormat(getContentType(req.Header))
+	resFmt := ExtractFormat(getAccept(req.Header))
+	accept := FormatToMime(resFmt, true)
+
+	result := specodec.Respond(reqCodec, req.Msg, reqFmt)
 
 	streamHeader := req.Header.Clone()
-	streamHeader.Set("Connect-Protocol-Version", "1")
+	streamHeader.Set("Content-Type", FormatToMime(reqFmt, true))
+	streamHeader.Set("Accept", accept)
+	if streamHeader.Get("Connect-Protocol-Version") == "" {
+		streamHeader.Set("Connect-Protocol-Version", "1")
+	}
 
-	status, respBody, _, err := c.doPost(c.baseURL+c.path, "application/connect+json", body, streamHeader)
+	status, respBody, _, err := c.doPost(c.baseURL+c.path, result.Body, streamHeader)
 	if err != nil {
 		return nil, err
 	}
 
 	if status != 200 {
-		var speconnErr SpeconnError
-		if err := json.Unmarshal(respBody, &speconnErr); err == nil && speconnErr.Code != "" {
-			return nil, &speconnErr
-		}
-		return nil, NewError(CodeFromHTTPStatus(status), string(respBody))
+		return nil, DecodeError(respBody, resFmt)
 	}
 
 	var results []*Response[Res]
@@ -124,23 +135,13 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req]) ([]*Response[Res], e
 			return nil, NewError(CodeDataLoss, "reading stream frame: "+err.Error())
 		}
 		if flags&FlagEndStream != 0 {
-			var trailer struct {
-				Error *struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			json.Unmarshal(payload, &trailer)
-			if trailer.Error != nil {
-				return results, NewError(CodeFromString(trailer.Error.Code), trailer.Error.Message)
+			if len(payload) > 0 {
+				return results, DecodeError(payload, resFmt)
 			}
 			break
 		}
-		var msg Res
-		if err := json.Unmarshal(payload, &msg); err != nil {
-			return nil, NewError(CodeInternal, "unmarshal stream message: "+err.Error())
-		}
-		results = append(results, &Response[Res]{Msg: &msg, Header: make(http.Header)})
+		res := specodec.Dispatch(resCodec, payload, resFmt)
+		results = append(results, &Response[Res]{Msg: res, Header: make(http.Header)})
 	}
 
 	return results, nil

@@ -1,6 +1,9 @@
 package speconn
 
-import "fmt"
+import (
+	"fmt"
+	specodec "github.com/specodec/specodec-go"
+)
 
 type Code string
 
@@ -109,4 +112,41 @@ func CodeFromString(s string) Code {
 		return c
 	}
 	return CodeUnknown
+}
+
+// Encode serialises e to the given format (json/msgpack/gron).
+func (e *SpeconnError) Encode(format string) []byte {
+	return specodec.Respond(specodec.SpecCodec[SpeconnError]{
+		Encode: func(w specodec.SpecWriter, obj *SpeconnError) {
+			w.BeginObject(2)
+			w.WriteField("code"); w.WriteString(string(obj.Code))
+			w.WriteField("message"); w.WriteString(obj.Message)
+			w.EndObject()
+		},
+	}, e, format).Body
+}
+
+// DecodeError decodes a non-empty payload into a SpeconnError.
+func DecodeError(payload []byte, format string) *SpeconnError {
+	type wire struct{ Code, Message string }
+	codec := specodec.SpecCodec[wire]{
+		Decode: func(r specodec.SpecReader) *wire {
+			obj := &wire{}
+			r.BeginObject()
+			for r.HasNextField() {
+				switch r.ReadFieldName() {
+				case "code":    obj.Code = r.ReadString()
+				case "message": obj.Message = r.ReadString()
+				default:        r.Skip()
+				}
+			}
+			r.EndObject()
+			return obj
+		},
+	}
+	w := specodec.Dispatch(codec, payload, format)
+	if w == nil {
+		return NewError(CodeUnknown, "decode error")
+	}
+	return NewError(CodeFromString(w.Code), w.Message)
 }

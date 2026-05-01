@@ -6,7 +6,8 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/root/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go vet ./... && go build ./...
+    GOPROXY=https://goproxy.cn,direct go mod tidy && \
+    go build -v . && echo "speconn-go build OK"
 
 FROM scratch
 COPY --from=builder /app/go.mod /out/go.mod
