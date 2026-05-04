@@ -2,26 +2,67 @@ package speconn
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
+	"time"
 
 	"github.com/specodec/specodec-go"
 )
 
-type Request[T any] struct {
-	Msg    *T
-	Header http.Header
+type CallOptions struct {
+	Headers   http.Header
+	TimeoutMs int64
 }
 
-func NewRequest[T any](msg *T) *Request[T] {
-	return &Request[T]{Msg: msg, Header: make(http.Header)}
+func NewCallOptions() *CallOptions {
+	return &CallOptions{Headers: make(http.Header)}
 }
 
 type Response[T any] struct {
-	Msg    *T
-	Header http.Header
+	Msg      *T
+	Headers  http.Header
+	Trailers http.Header
+}
+
+type StreamResponse[T any] struct {
+	Headers  http.Header
+	Trailers http.Header
+	msgs     []*T
+}
+
+func (s *StreamResponse[T]) All() iter.Seq2[*T, error] {
+	return func(yield func(*T, error) bool) {
+		for _, msg := range s.msgs {
+			if !yield(msg, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (s *StreamResponse[T]) addMsg(msg *T) {
+	s.msgs = append(s.msgs, msg)
+}
+
+func (s *StreamResponse[T]) setTrailers(t http.Header) {
+	s.Trailers = t
+}
+
+func splitHeadersTrailers(rawHeaders http.Header) (headers, trailers http.Header) {
+	headers = make(http.Header)
+	trailers = make(http.Header)
+	for k, vs := range rawHeaders {
+		if len(k) > 8 && k[:8] == "Trailer-" {
+			trailers[k[8:]] = vs
+		} else {
+			headers[k] = vs
+		}
+	}
+	return headers, trailers
 }
 
 type SpeconnClient[Req any, Res any] struct {
@@ -54,7 +95,7 @@ func getAccept(h http.Header) string {
 	return accept
 }
 
-func (c *SpeconnClient[Req, Res]) doPost(url string, body []byte, reqHeader http.Header) (int, []byte, http.Header, error) {
+func (c *SpeconnClient[Req, Res]) doPost(url string, body []byte, reqHeader http.Header, timeoutMs int64) (int, []byte, http.Header, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, NewError(CodeInternal, err.Error())
@@ -63,6 +104,11 @@ func (c *SpeconnClient[Req, Res]) doPost(url string, body []byte, reqHeader http
 		for _, v := range vs {
 			httpReq.Header.Add(k, v)
 		}
+	}
+	if timeoutMs > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		defer cancel()
+		httpReq = httpReq.WithContext(ctx)
 	}
 	resp, err := c.transport.Do(httpReq)
 	if err != nil {
@@ -76,18 +122,21 @@ func (c *SpeconnClient[Req, Res]) doPost(url string, body []byte, reqHeader http
 	return resp.StatusCode, respBody, resp.Header, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Call(req *Request[Req], reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res]) (*Response[Res], error) {
-	contentType := getContentType(req.Header)
-	accept := getAccept(req.Header)
+func (c *SpeconnClient[Req, Res]) Call(req *Req, reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res], opts *CallOptions) (*Response[Res], error) {
+	if opts == nil {
+		opts = NewCallOptions()
+	}
+	contentType := getContentType(opts.Headers)
+	accept := getAccept(opts.Headers)
 
 	reqFmt := ExtractFormat(contentType)
 	resFmt := ExtractFormat(accept)
 
-	result := specodec.Respond(reqCodec, req.Msg, reqFmt)
-	req.Header.Set("Content-Type", FormatToMime(reqFmt, false))
-	req.Header.Set("Accept", FormatToMime(resFmt, false))
+	result := specodec.Respond(reqCodec, req, reqFmt)
+	opts.Headers.Set("Content-Type", FormatToMime(reqFmt, false))
+	opts.Headers.Set("Accept", FormatToMime(resFmt, false))
 
-	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, result.Body, req.Header)
+	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, result.Body, opts.Headers, opts.TimeoutMs)
 	if err != nil {
 		return nil, err
 	}
@@ -97,24 +146,28 @@ func (c *SpeconnClient[Req, Res]) Call(req *Request[Req], reqCodec specodec.Spec
 	}
 
 	res := specodec.Dispatch(resCodec, respBody, resFmt)
-	return &Response[Res]{Msg: res, Header: respHeader}, nil
+	headers, trailers := splitHeadersTrailers(respHeader)
+	return &Response[Res]{Msg: res, Headers: headers, Trailers: trailers}, nil
 }
 
-func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req], reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res]) ([]*Response[Res], error) {
-	reqFmt := ExtractFormat(getContentType(req.Header))
-	resFmt := ExtractFormat(getAccept(req.Header))
+func (c *SpeconnClient[Req, Res]) Stream(req *Req, reqCodec specodec.SpecCodec[Req], resCodec specodec.SpecCodec[Res], opts *CallOptions) (*StreamResponse[Res], error) {
+	if opts == nil {
+		opts = NewCallOptions()
+	}
+	reqFmt := ExtractFormat(getContentType(opts.Headers))
+	resFmt := ExtractFormat(getAccept(opts.Headers))
 	accept := FormatToMime(resFmt, true)
 
-	result := specodec.Respond(reqCodec, req.Msg, reqFmt)
+	result := specodec.Respond(reqCodec, req, reqFmt)
 
-	streamHeader := req.Header.Clone()
+	streamHeader := opts.Headers.Clone()
 	streamHeader.Set("Content-Type", FormatToMime(reqFmt, true))
 	streamHeader.Set("Accept", accept)
 	if streamHeader.Get("Connect-Protocol-Version") == "" {
 		streamHeader.Set("Connect-Protocol-Version", "1")
 	}
 
-	status, respBody, _, err := c.doPost(c.baseURL+c.path, result.Body, streamHeader)
+	status, respBody, respHeader, err := c.doPost(c.baseURL+c.path, result.Body, streamHeader, opts.TimeoutMs)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +176,9 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req], reqCodec specodec.Sp
 		return nil, DecodeError(respBody, resFmt)
 	}
 
-	var results []*Response[Res]
+	headers, trailers := splitHeadersTrailers(respHeader)
+	streamResp := &StreamResponse[Res]{Headers: headers, Trailers: trailers}
+
 	reader := &frameReader{data: respBody}
 
 	for {
@@ -136,15 +191,16 @@ func (c *SpeconnClient[Req, Res]) Stream(req *Request[Req], reqCodec specodec.Sp
 		}
 		if flags&FlagEndStream != 0 {
 			if len(payload) > 0 {
-				return results, DecodeError(payload, resFmt)
+				return streamResp, DecodeError(payload, resFmt)
 			}
 			break
 		}
 		res := specodec.Dispatch(resCodec, payload, resFmt)
-		results = append(results, &Response[Res]{Msg: res, Header: make(http.Header)})
+		streamResp.addMsg(res)
 	}
 
-	return results, nil
+	streamResp.setTrailers(trailers)
+	return streamResp, nil
 }
 
 type frameReader struct {

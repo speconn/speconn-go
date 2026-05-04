@@ -17,7 +17,7 @@ package main
 
 import (
     "net/http"
-    "github.com/speconn/speconn-go/speconn"
+    "github.com/speconn/speconn-runtime-golang/speconn"
 )
 
 type CheckRequest struct {

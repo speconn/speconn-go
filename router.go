@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/specodec/specodec-go"
 )
 
 type Handler func(ctx *SpeconnContext, body []byte, ct string, accept string) ([]byte, error)
@@ -42,6 +44,41 @@ func (r *Router) AddStreamHandler(path string, handler StreamHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.streamRoutes[path] = handler
+}
+
+// AddTypedUnaryHandler registers a typed unary handler using codec for encode/decode.
+func AddTypedUnaryHandler[Req any, Res any](
+	r *Router,
+	path string,
+	reqCodec specodec.SpecCodec[Req],
+	resCodec specodec.SpecCodec[Res],
+	handler func(*SpeconnContext, *Req) (*Res, error),
+) {
+	r.AddUnaryHandler(path, func(ctx *SpeconnContext, body []byte, ct string, accept string) ([]byte, error) {
+		req := specodec.Dispatch(reqCodec, body, ExtractFormat(ct))
+		res, err := handler(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return specodec.Respond(resCodec, res, ExtractFormat(accept)).Body, nil
+	})
+}
+
+// AddTypedStreamHandler registers a typed server-stream handler using codec for encode/decode.
+func AddTypedStreamHandler[Req any, Res any](
+	r *Router,
+	path string,
+	reqCodec specodec.SpecCodec[Req],
+	resCodec specodec.SpecCodec[Res],
+	handler func(*SpeconnContext, *Req, func(*Res) error) error,
+) {
+	r.AddStreamHandler(path, func(ctx *SpeconnContext, body []byte, ct string, accept string, send func([]byte) error) error {
+		req := specodec.Dispatch(reqCodec, body, ExtractFormat(ct))
+		resFmt := ExtractFormat(accept)
+		return handler(ctx, req, func(msg *Res) error {
+			return send(specodec.Respond(resCodec, msg, resFmt).Body)
+		})
+	})
 }
 
 func (r *Router) AddInterceptor(interceptor Interceptor) {
